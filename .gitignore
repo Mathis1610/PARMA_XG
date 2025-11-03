@@ -1,0 +1,21 @@
+# 🔒 Environnements virtuels
+.venv/
+env/
+venv/
+
+# 📦 Dossiers générés automatiquement
+__pycache__/
+artifacts/
+mlruns/
+mlartifacts/
+
+# 📊 Données locales
+data/
+*.csv
+*.xlsx
+
+# ⚙️ Fichiers temporaires ou systèmes
+*.log
+*.db
+.DS_Store
+Thumbs.db
