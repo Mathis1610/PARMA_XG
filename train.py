@@ -8,7 +8,7 @@ with datasets that share the same schema but different values.
 # .\.venv\Scripts\activate
 
 # =====================================================
-# Configuration de MLflow
+# Configuration MLflow
 # =====================================================
 
 from __future__ import annotations
@@ -391,36 +391,72 @@ def get_feature_types(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     ]
     return numeric_columns, categorical_columns
 
-
 def tune_model(pipeline, model_name, x_train, y_train, random_state):
     """
-    Perform advanced hyperparameter tuning with progress tracking and MLflow logging.
+    Advanced hyperparameter tuning with progress tracking and MLflow logging.
+
+    This function abstracts the tuning strategy for each supported model family:
+      - Logistic Regression / Random Forest → exhaustive GridSearchCV
+      - LightGBM / XGBoost → randomized search over a wider space (RandomizedSearchCV)
+
+    Why two strategies?
+    - Grid search is fine for small, well-behaved grids (LogReg, RF).
+    - Randomized search explores larger spaces more efficiently (LGBM, XGB).
+
+    Parameters
+    ----------
+    pipeline : sklearn.Pipeline
+        End-to-end pipeline (preprocessing + estimator) to tune.
+    model_name : str
+        One of {"logreg", "rf", "lgbm", "xgb"} to select the search space.
+    x_train, y_train : pd.DataFrame, pd.Series
+        Training split used for cross-validated search.
+    random_state : int
+        Seed for reproducibility (used by randomized searches).
+
+    Returns
+    -------
+    sklearn.Pipeline
+        The fitted best estimator (pipeline with best hyperparameters).
     """
 
     logging.info(f"🎯 Hyperparameter tuning for {model_name.upper()} started...")
 
-    # Définition des grilles de recherche
+    # --- Define model-specific search spaces ---------------------------------
     if model_name == "logreg":
+        # Small, interpretable grid for a convex problem → GridSearchCV is fine
         param_grid = {
             "model__C": [0.01, 0.1, 1, 10],
             "model__penalty": ["l2"],
             "model__solver": ["lbfgs", "saga"],
         }
         search = GridSearchCV(
-            pipeline, param_grid, cv=5, scoring="roc_auc", n_jobs=-1, verbose=0
+            pipeline,
+            param_grid=param_grid,
+            cv=5,
+            scoring="roc_auc",
+            n_jobs=-1,
+            verbose=0,
         )
 
     elif model_name == "rf":
+        # RF has a few influential levers; grid is still manageable
         param_grid = {
             "model__n_estimators": [200, 400, 600],
             "model__max_depth": [None, 10, 20, 30],
             "model__max_features": ["sqrt", "log2"],
         }
         search = GridSearchCV(
-            pipeline, param_grid, cv=5, scoring="roc_auc", n_jobs=-1, verbose=0
+            pipeline,
+            param_grid=param_grid,
+            cv=5,
+            scoring="roc_auc",
+            n_jobs=-1,
+            verbose=0,
         )
 
     elif model_name == "lgbm":
+        # Larger space → randomized search explores faster under a fixed budget
         param_dist = {
             "model__num_leaves": [20, 31, 40, 60, 80, 120],
             "model__learning_rate": [0.005, 0.01, 0.03, 0.05, 0.1],
@@ -434,8 +470,8 @@ def tune_model(pipeline, model_name, x_train, y_train, random_state):
         search = RandomizedSearchCV(
             pipeline,
             param_distributions=param_dist,
-            n_iter=50,
-            cv=10,
+            n_iter=50,            # budget: increase for deeper search (time ↑)
+            cv=10,                # robust CV for imbalanced data + AUC metric
             scoring="roc_auc",
             random_state=random_state,
             n_jobs=-1,
@@ -443,6 +479,7 @@ def tune_model(pipeline, model_name, x_train, y_train, random_state):
         )
 
     elif model_name == "xgb":
+        # Similar randomized strategy for XGBoost
         param_dist = {
             "model__learning_rate": [0.005, 0.01, 0.03, 0.05, 0.1],
             "model__max_depth": [3, 4, 5, 6, 8],
@@ -468,23 +505,22 @@ def tune_model(pipeline, model_name, x_train, y_train, random_state):
     else:
         raise ValueError(f"Tuning not supported for model: {model_name}")
 
-    # Barre de progression + suivi du temps
-    logging.info("🚀 Starting RandomizedSearchCV...")
+    # --- Run the search and time it ------------------------------------------
+    logging.info("🚀 Starting hyperparameter search...")
     start_time = time()
-
     search.fit(x_train, y_train)
-
     elapsed = (time() - start_time) / 60
+
     logging.info(f"✅ Tuning finished in {elapsed:.2f} min")
     logging.info(f"🏆 Best AUC = {search.best_score_:.4f}")
     logging.info(f"🎯 Best params = {search.best_params_}")
 
-    # --- 🔹 Log dans MLflow
+    # --- Track results in MLflow ---------------------------------------------
     mlflow.log_params(search.best_params_)
     mlflow.log_metric("cv_best_auc", search.best_score_)
     mlflow.log_metric("tuning_time_min", round(elapsed, 2))
 
-    # --- 🔹 Export de la table des résultats complets
+    # Save full CV results (useful for later analysis/repro)
     results_df = pd.DataFrame(search.cv_results_)
     results_path = Path("artifacts") / "tuning_results"
     results_path.mkdir(parents=True, exist_ok=True)
@@ -493,6 +529,7 @@ def tune_model(pipeline, model_name, x_train, y_train, random_state):
     mlflow.log_artifact(str(csv_path))
     logging.info(f"📁 Saved all tuning results to {csv_path}")
 
+    # Return the best fitted pipeline (already refit on full training data)
     return search.best_estimator_
 
 
@@ -500,7 +537,21 @@ def evaluate_model(
     pipeline: Pipeline,
     split: DatasetSplit,
 ) -> Tuple[dict, pd.DataFrame]:
+    """
+    Evaluate the trained pipeline on the test split.
+
+    We compute:
+      - ROC-AUC on probabilities (threshold-independent ranking quality)
+      - Log Loss (calibration of probabilities)
+      - Accuracy (threshold-dependent; less informative for imbalance)
+      - Full classification report (precision/recall/F1 per class)
+
+    Returns a (metrics_dict, report_df) pair to both log and inspect.
+    """
+    # Predict well-calibrated probabilities first (needed for AUC/logloss)
     y_pred_proba = pipeline.predict_proba(split.x_test)[:, 1]
+
+    # Turn probabilities into hard labels at 0.5 (simple baseline threshold)
     y_pred = (y_pred_proba >= 0.5).astype(int)
 
     metrics = {
@@ -509,6 +560,7 @@ def evaluate_model(
         "roc_auc": roc_auc_score(split.y_test, y_pred_proba),
     }
 
+    # Rich per-class report (includes weighted/macro averages)
     report = classification_report(
         split.y_test, y_pred, output_dict=True, zero_division=0
     )
@@ -518,7 +570,15 @@ def evaluate_model(
 
 
 def log_confusion_matrix(pipeline: Pipeline, split: DatasetSplit, output_dir: Path) -> Path:
-    disp = ConfusionMatrixDisplay.from_estimator(
+    """
+    Compute and save a confusion matrix image for the test set.
+
+    Useful to visualize the trade-off between false positives and false negatives
+    at the current 0.5 threshold (you may later tune this threshold by maximizing
+    F1, Youden’s J, cost-sensitive metrics, etc.).
+    """
+    # Build the plot from the estimator's predictions
+    ConfusionMatrixDisplay.from_estimator(
         pipeline,
         split.x_test,
         split.y_test,
@@ -528,6 +588,7 @@ def log_confusion_matrix(pipeline: Pipeline, split: DatasetSplit, output_dir: Pa
     plt.title("Confusion Matrix")
     plt.tight_layout()
 
+    # Persist to artifacts
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "confusion_matrix.png"
     plt.savefig(output_path)
@@ -541,17 +602,25 @@ def log_feature_importance(
     feature_names: List[str],
     output_dir: Path,
 ) -> Path:
-    """Log feature importance or coefficients depending on model type."""
+    """
+    Export feature importance (tree models) or coefficients (linear models).
+
+    - Logistic Regression exposes `coef_` (weights after preprocessing).
+    - Tree-based models (RF/LGBM/XGB) expose `feature_importances_`.
+    The function resolves the transformed feature names from the ColumnTransformer
+    so the CSV is human-readable and aligned with the one-hot encoded design.
+    """
 
     model = pipeline.named_steps["model"]
 
-    # Cas 1 : modèles linéaires (Logistic Regression)
+    # --- Linear models: coefficients -----------------------------------------
     if hasattr(model, "coef_"):
         preprocessor = pipeline.named_steps["preprocessor"]
         if hasattr(preprocessor, "get_feature_names_out"):
             try:
                 transformed_feature_names = preprocessor.get_feature_names_out(feature_names)
             except TypeError:
+                # Some sklearn versions require no args
                 transformed_feature_names = preprocessor.get_feature_names_out()
         else:
             transformed_feature_names = feature_names
@@ -561,7 +630,7 @@ def log_feature_importance(
             {"feature": transformed_feature_names, "importance": coef}
         )
 
-    # Cas 2 : modèles à arbres (LightGBM, XGBoost, RandomForest)
+    # --- Tree models: impurity-based importance -------------------------------
     elif hasattr(model, "feature_importances_"):
         preprocessor = pipeline.named_steps["preprocessor"]
         if hasattr(preprocessor, "get_feature_names_out"):
@@ -581,11 +650,12 @@ def log_feature_importance(
             "Model does not expose feature importance or coefficients for analysis."
         )
 
-    # Tri et sauvegarde
+    # Sort by absolute contribution to surface the most influential features
     importance_df = importance_df.sort_values(
         by="importance", key=lambda s: s.abs(), ascending=False
     )
 
+    # Save to artifacts for easy inspection in MLflow
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "feature_importance.csv"
     importance_df.to_csv(output_path, index=False)
@@ -593,13 +663,22 @@ def log_feature_importance(
     return output_path
 
 
-
 def log_predictions(
     pipeline: Pipeline,
     split: DatasetSplit,
     output_dir: Path,
 ) -> Path:
+    """
+    Save per-example predictions for the test split.
+
+    This CSV is extremely useful for:
+      - Manual spot-checks (what did we miss?)
+      - Threshold tuning / decision analysis
+      - Downstream dashboards or error analysis notebooks
+    """
     probabilities = pipeline.predict_proba(split.x_test)[:, 1]
+
+    # Include original features to ease later analysis/joins
     predictions_df = split.x_test.copy()
     predictions_df["y_true"] = split.y_test.values
     predictions_df["y_pred"] = (probabilities >= 0.5).astype(int)
@@ -620,55 +699,84 @@ def log_artifacts(
     artifact_dir: Path,
     requirements_path: Optional[Path] = None,
 ) -> None:
+    """
+    Log all useful runtime artifacts to MLflow for full reproducibility:
+
+      - metrics.json: compact set of key metrics
+      - classification_report.csv: precision/recall/F1 per class
+      - confusion_matrix.png: threshold-based error distribution
+      - feature_importance.csv: model explainability snapshot
+      - test_predictions.csv: row-level outputs for error analysis
+      - requirements.txt (optional): environment capture
+    """
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
+    # 1) Key metrics as JSON (easy to diff across runs)
     metrics_path = artifact_dir / "metrics.json"
     with metrics_path.open("w", encoding="utf-8") as fp:
         json.dump(metrics, fp, indent=2)
     mlflow.log_artifact(str(metrics_path))
 
+    # 2) Detailed classification report
     report_path = artifact_dir / "classification_report.csv"
     report_df.to_csv(report_path, index=True)
     mlflow.log_artifact(str(report_path))
 
+    # 3) Confusion matrix image
     conf_matrix_path = log_confusion_matrix(pipeline, split, artifact_dir)
     mlflow.log_artifact(str(conf_matrix_path))
 
+    # 4) Feature importance / coefficients
     feature_names = split.x_train.columns.tolist()
     importance_path = log_feature_importance(pipeline, feature_names, artifact_dir)
     mlflow.log_artifact(str(importance_path))
-  
+
+    # 5) Row-level predictions on the test set
     predictions_path = log_predictions(pipeline, split, artifact_dir)
     mlflow.log_artifact(str(predictions_path))
 
+    # 6) Environment capture (optional but recommended)
     if requirements_path and requirements_path.exists():
         mlflow.log_artifact(str(requirements_path), artifact_path="environment")
 
 
 def main() -> None:
+    """
+    Orchestrate the full training run:
+      1) Parse CLI args and configure logging
+      2) Connect to MLflow and set the experiment
+      3) Load & preprocess data (X, y)
+      4) Build the preprocessing + model pipeline
+      5) (Optional) Hyperparameter tuning
+      6) Evaluate on the hold-out test set
+      7) Log metrics, artifacts, and the model to MLflow
+    """
     args = parse_args()
-    # Donne un nom automatique au run s'il n'est pas précisé
+
+    # If no explicit run name, create a readable timestamped one
     if args.run_name is None:
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         args.run_name = f"{args.model}_run_{timestamp}"
 
     configure_logging()
-    
 
-    # Ferme tout run MLflow encore actif (sécurité)
+    # Close any active MLflow run (defensive)
     mlflow.end_run()
 
+    # Ensure we talk to the expected tracking server
     mlflow.set_tracking_uri("http://127.0.0.1:5000")
     logging.info("✅ Connected to MLflow server at http://127.0.0.1:5000")
 
-    # Crée un experiment différent pour chaque modèle
+    # Create a dedicated experiment per model family for clean comparisons
     experiment_name = f"{args.experiment_name}_{args.model}"
     mlflow.set_experiment(experiment_name)
     logging.info(f"📁 Using MLflow experiment: {experiment_name}")
 
+    # Reproducibility: fix seeds for numpy/random (and model seeds where possible)
     set_reproducibility(args.random_state)
 
+    # --- Load & preprocess ----------------------------------------------------
     df = load_dataset(args.data_path)
     features, target = preprocess_dataset(
         df,
@@ -677,10 +785,10 @@ def main() -> None:
         positive_class=args.positive_class,
     )
 
-    # Étape 1 : détection des types de variables
+    # 1) Infer feature types (numeric vs categorical)
     numeric_features, categorical_features = get_feature_types(features)
 
-    # Étape 2 : construction du pipeline selon le modèle choisi
+    # 2) Build the preprocessing + estimator pipeline for the chosen model
     pipeline = build_pipeline(
         numeric_features,
         categorical_features,
@@ -690,22 +798,26 @@ def main() -> None:
     )
     mlflow.log_param("model_type", args.model)
 
-    # Étape 3 : séparation des données
+    # 3) Train/test split (hold-out for honest evaluation)
     dataset_split = split_dataset(
         features, target, test_size=args.test_size, random_state=args.random_state
     )
 
-    # Bloc MLflow sécurisé
+    # --- MLflow run scope -----------------------------------------------------
     try:
-        with mlflow.start_run(run_name=args.run_name, nested=True):  # 🔹 nested=True = évite les conflits
+        # nested=True prevents conflicts if called from a parent run
+        with mlflow.start_run(run_name=args.run_name, nested=True):
+            # Tags help filter/search runs later
             mlflow.set_tag("model", args.model)
             mlflow.set_tag("dataset", str(args.data_path))
+
             logging.info(
                 "Starting MLflow run with %d training samples and %d test samples",
                 len(dataset_split.x_train),
                 len(dataset_split.x_test),
             )
-        
+
+            # Log high-level run parameters (data shape, test size, etc.)
             mlflow.log_params(
                 {
                     "test_size": args.test_size,
@@ -716,7 +828,7 @@ def main() -> None:
                 }
             )
 
-            # Entraînement
+            # --- Train (with or without tuning) -------------------------------
             if args.tune:
                 logging.info("🎯 Hyperparameter tuning activated.")
                 pipeline = tune_model(
@@ -730,11 +842,11 @@ def main() -> None:
                 logging.info("🚀 Training model without tuning.")
                 pipeline.fit(dataset_split.x_train, dataset_split.y_train)
 
-
+            # Persist final model hyperparameters (after tuning/fit)
             for param_name, value in pipeline.named_steps["model"].get_params().items():
                 mlflow.log_param(f"model__{param_name}", value)
 
-            # Évaluation
+            # --- Evaluate & log ----------------------------------------------
             metrics, report_df = evaluate_model(pipeline, dataset_split)
             mlflow.log_metrics(metrics)
 
@@ -749,7 +861,7 @@ def main() -> None:
                 requirements_path=requirements_path,
             )
 
-            # Sauvegarde du modèle
+            # --- Register the trained pipeline as an MLflow model ------------
             signature = infer_signature(
                 dataset_split.x_test, pipeline.predict_proba(dataset_split.x_test)
             )
@@ -763,6 +875,7 @@ def main() -> None:
             logging.info("Run complete. Metrics: %s", metrics)
 
     finally:
+        # Always close the run even if an exception occurs
         mlflow.end_run()
 
 

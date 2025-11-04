@@ -1,8 +1,8 @@
 # ===============================================
 # ⚽ generate_xg_predictions.py
 # ===============================================
-# Génère la colonne xG_pred pour chaque tir en utilisant
-# le meilleur modèle MLflow (LightGBM ou XGBoost)
+# Generates the "xG_pred" column (Expected Goals probability)
+# for each shot using the best MLflow model (LightGBM or XGBoost).
 # ===============================================
 
 import mlflow
@@ -12,29 +12,31 @@ import numpy as np
 import logging
 
 # -----------------------------------------------------------
-# 1️⃣ Configuration générale
+# 1️⃣ General configuration
 # -----------------------------------------------------------
-mlflow.set_tracking_uri("http://127.0.0.1:5000")
-DATA_PATH = Path("data/shots.xlsx")
-OUTPUT_PATH = Path("data/shots_with_xg.csv")
+mlflow.set_tracking_uri("http://127.0.0.1:5000")  # Connect to local MLflow server
+DATA_PATH = Path("data/shots.xlsx")               # Input dataset
+OUTPUT_PATH = Path("data/shots_with_xg.csv")      # Output file with xG predictions
 
+# Configure simple console logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 
 # -----------------------------------------------------------
-# 2️⃣ Charger le meilleur run (selon ROC-AUC)
+# 2️⃣ Retrieve the best run (based on ROC-AUC)
 # -----------------------------------------------------------
 def get_best_run(experiment_names):
-    """Retourne le meilleur run (AUC max) parmi les expériences données."""
+    """Return the best MLflow run (highest ROC-AUC) among the provided experiments."""
     best_run = None
     best_auc = -np.inf
 
     for exp_name in experiment_names:
         exp = mlflow.get_experiment_by_name(exp_name)
         if exp is None:
-            logging.warning(f"Expérience {exp_name} non trouvée, ignorée.")
+            logging.warning(f"Experiment {exp_name} not found, skipping.")
             continue
 
+        # Search for the top run in the experiment (sorted by ROC-AUC)
         runs = mlflow.search_runs(
             experiment_ids=[exp.experiment_id],
             order_by=["metrics.roc_auc DESC"],
@@ -45,12 +47,12 @@ def get_best_run(experiment_names):
             best_run = runs.iloc[0]
 
     if best_run is None:
-        raise ValueError("Aucun run valide trouvé dans les expériences MLflow.")
+        raise ValueError("No valid MLflow runs found in the provided experiments.")
     return best_run
 
 
 # -----------------------------------------------------------
-# 3️⃣ Charger le modèle le plus performant
+# 3️⃣ Load the best-performing model
 # -----------------------------------------------------------
 experiments = ["expected-goals_lgbm", "expected-goals_xgb"]
 best_run = get_best_run(experiments)
@@ -59,52 +61,58 @@ run_id = best_run["run_id"]
 auc = best_run["metrics.roc_auc"]
 model_type = best_run["tags.model"]
 
-logging.info(f"🏆 Meilleur modèle trouvé : {model_type.upper()} (AUC={auc:.4f})")
-logging.info(f"🔗 Run ID : {run_id}")
+logging.info(f"🏆 Best model found: {model_type.upper()} (AUC={auc:.4f})")
+logging.info(f"🔗 Run ID: {run_id}")
 
+# Load the model directly from MLflow artifacts
 model_uri = f"runs:/{run_id}/model"
 model = mlflow.sklearn.load_model(model_uri)
 
+
 # -----------------------------------------------------------
-# 4️⃣ Charger les données et faire les prédictions
+# 4️⃣ Load the dataset and generate predictions
 # -----------------------------------------------------------
-logging.info(f"📂 Chargement du dataset : {DATA_PATH}")
+logging.info(f"📂 Loading dataset: {DATA_PATH}")
 df = pd.read_excel(DATA_PATH)
 
-# On garde la même logique de colonnes que dans train.py
+# Keep the same column logic as in train.py
 target_col = "is_goal"
 if target_col in df.columns:
     X = df.drop(columns=[target_col])
 else:
     X = df.copy()
 
-# Prédictions de probabilité (Expected Goals)
-logging.info("⚙️ Génération des probabilités xG...")
+# Predict the probability of scoring (Expected Goals)
+logging.info("⚙️ Generating xG probabilities...")
 df["xG_pred"] = model.predict_proba(X)[:, 1]
 
+
 # ===============================================
-# 🏷️ Création d'un identifiant de match automatique
+# 🏷️ Automatically create match identifiers
 # ===============================================
 df = df.reset_index(drop=True)
-# Détection des débuts de nouveaux matchs :
-# chaque fois que la période repasse de 2 → 1
+
+# Detect the start of new matches:
+# whenever the period switches from 2 → 1, start a new match
 df["match_id"] = (df["period_id"].shift(1) == 2) & (df["period_id"] == 1)
-df["match_id"] = df["match_id"].cumsum() + 1  # incrémentation progressive
+df["match_id"] = df["match_id"].cumsum() + 1  # increment progressively
 
 print(df[["period_id", "min", "sec", "match_id"]].head(20))
 
+
 # -----------------------------------------------------------
-# 5️⃣ Sauvegarde
+# 5️⃣ Save the predictions
 # -----------------------------------------------------------
 OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 df.to_csv(OUTPUT_PATH, index=False)
-logging.info(f"✅ Fichier sauvegardé : {OUTPUT_PATH.resolve()}")
+logging.info(f"✅ File saved: {OUTPUT_PATH.resolve()}")
 
-# Aperçu
+# Display a small preview
 print(df[["x", "y", "xG_pred", "is_goal"]].head())
 
+
 # ===============================================
-# ⚽ Visualisation des tirs et des xG (terrain réaliste)
+# ⚽ Visualization of shots and xG (realistic pitch)
 # ===============================================
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -115,13 +123,13 @@ shots = df.copy()
 fig, ax = plt.subplots(figsize=(10, 6))
 plt.gca().set_facecolor("#E6E6E6")
 
-# Tracé du terrain simplifié
+# Draw a simple football pitch
 plt.plot([0, 100, 100, 0, 0], [0, 0, 100, 100, 0], color="black", linewidth=2)
 
-# But à droite (x=100)
-plt.plot([100, 100], [36.8, 63.2], color="red", linewidth=4, label="But adverse")
+# Goal on the right side (x = 100)
+plt.plot([100, 100], [36.8, 63.2], color="red", linewidth=4, label="Opponent Goal")
 
-# Représentation des tirs
+# Plot the shots: color = goal/no goal, size = xG value
 sns.scatterplot(
     data=shots,
     x="x", y="y",
@@ -136,18 +144,17 @@ sns.scatterplot(
 ax.set_xlim(0, 100)
 ax.set_ylim(0, 100)
 
-plt.title("Carte des tirs et probabilités xG", fontsize=14)
-plt.xlabel("Position X (0 = notre but, 100 = but adverse)")
-plt.ylabel("Position Y (largeur du terrain)")
-plt.legend(title="But marqué", loc="upper left", frameon=True)
+plt.title("Shot Map with xG Probabilities", fontsize=14)
+plt.xlabel("Position X (0 = own goal, 100 = opponent goal)")
+plt.ylabel("Position Y (pitch width)")
+plt.legend(title="Goal scored", loc="upper left", frameon=True)
 plt.tight_layout()
 
-# Sauvegarde
+# Save the visualization
 output_img = Path("artifacts") / "visuals"
 output_img.mkdir(parents=True, exist_ok=True)
 save_path = output_img / "xg_shotmap.png"
 plt.savefig(save_path, dpi=300)
-print(f"✅ Graphique sauvegardé : {save_path.resolve()}")
+print(f"✅ Visualization saved: {save_path.resolve()}")
 
 plt.show()
-

@@ -1,20 +1,20 @@
-# 🔒 Environnements virtuels
+# Virtual environments
 .venv/
 env/
 venv/
 
-# 📦 Dossiers générés automatiquement
+# Automatically generated folders
 __pycache__/
 artifacts/
 mlruns/
 mlartifacts/
 
-# 📊 Données locales
+# Local data files
 data/
 *.csv
 *.xlsx
 
-# ⚙️ Fichiers temporaires ou systèmes
+# Temporary or system files
 *.log
 *.db
 .DS_Store
